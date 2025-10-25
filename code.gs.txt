@@ -1,0 +1,724 @@
+/*************************************************
+ * PR Dashboard — Apps Script backend (code.gs)
+ * - UI window: from 2025-07 (inclusive) to current month (default)
+ * - Exclude June 2025 only
+ * - PR Monthly: keep rows only when Total Deposit > 0
+ * - DW synth: months & rows derived from PR rows (dep > 0)
+ * - FX: EOM snapshot for USD (no monthly averages), same fallbacks as your HTML
+ **************************************************/
+
+/** ==== CONFIG ==== */
+const SPREADSHEET_ID = '1zn5HXte_YD_eJfe1TwnjbJXvnUwAYyBvUVDKsnG6Ttw';
+const SHEET_PR = 'PR Monthly';
+const RANGE_PR = 'B9:Z'; // includes header row
+
+// Single source of truth for default UI window
+const UI_START_YM = '2025-07'; // July 2025 inclusive
+
+// Currencies used by your UI table
+const CCYS = [
+  "USD","AED","AUD","BDT","BRL","CAD","CNY","EUR","HKD","IDR","INR","KRW","LKR","MMK","MYR","NPR",
+  "OMR","PHP","PKR","SAR","SGD","THB","TRY","VND"
+];
+
+// Same list as in your HTML: ECB misses or problematic
+const MISSING_CCYS = ["AED","BDT","LKR","MMK","NPR","OMR","PKR","SAR","VND"];
+const PEGGED_CCYS  = ["AED","OMR","SAR"];
+
+/** ===== Serve UI (+ JSON tools: verifyFX, fxPeek) ===== */
+function doGet(e) {
+  try {
+    if (e && e.parameter) {
+      const action = String(e.parameter.action || '').trim();
+      if (action === 'verifyFX') {
+        const monthsCsv = (e.parameter.months || '').trim();
+        return asJSON_(verifyFXRun_(monthsCsv));
+      }
+      if (action === 'fxPeek') {
+        const monthsCsv = (e.parameter.months || '').trim();
+        const ccyCsv = (e.parameter.ccy || '').trim();
+        return asJSON_(fxPeekRun_(monthsCsv, ccyCsv));
+      }
+    }
+  } catch (err) {
+    return asJSON_({ ok:false, error:String(err && err.message || err) });
+  }
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('InsightTrack')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/** ===== Utilities ===== */
+function open_(){ return SpreadsheetApp.openById(SPREADSHEET_ID); }
+
+function getRangeValues_(sheetName, a1){
+  const sh = open_().getSheetByName(sheetName);
+  if(!sh) throw new Error('Sheet not found: ' + sheetName);
+  const vals = sh.getRange(a1).getValues();
+  return trim2d_(vals);
+}
+function trim2d_(arr){
+  if(!arr.length) return arr;
+  let rows = arr.length;
+  while(rows && arr[rows-1].every(v => v==='' || v==null)) rows--;
+  let lastCol = (arr[0]?arr[0].length:0)-1;
+  for(; lastCol>=0; lastCol--){
+    const hv = arr[0][lastCol];
+    if(!(hv==='' || hv==null)) break;
+  }
+  const out = [];
+  for(let r=0;r<rows;r++) out.push(arr[r].slice(0,lastCol+1));
+  return out;
+}
+
+function normalizeNumber_(v){
+  if(v==='' || v==null) return v;
+  if(typeof v==='number') return v;
+  if(typeof v==='string'){
+    const s = v.replace(/,/g,'').trim();
+    const pct = s.endsWith('%');
+    const num = parseFloat(pct ? s.slice(0,-1) : s);
+    if(isNaN(num)) return v;
+    return num;
+  }
+  return v;
+}
+
+function parseMonth_(s){
+  if(!s) return null;
+  if(/^\d{4}-\d{2}$/.test(s)){
+    const [Y,M]=s.split('-').map(Number);
+    return new Date(Date.UTC(Y, M-1, 1));
+  }
+  const try1 = new Date(Date.parse(`01 ${s} UTC`));
+  if(!isNaN(try1)) return try1;
+  const try2 = new Date(Date.parse(`${s}-01T00:00:00Z`));
+  if(!isNaN(try2)) return try2;
+  return null;
+}
+
+function formatMonthLabel_(d){ return Utilities.formatDate(d,'UTC','MMMM yyyy'); }
+function toYM_(d){ return Utilities.formatDate(d, 'UTC', 'yyyy-MM'); }
+
+function normalizeYM_(x){
+  if(x==null) return null;
+  if(Object.prototype.toString.call(x)==='[object Date]' && !isNaN(x)) return toYM_(x);
+  const s = String(x).trim();
+  if(/^\d{4}-\d{2}$/.test(s)) return s;
+  const d = parseMonth_(s);
+  return (d && !isNaN(d)) ? toYM_(d) : null;
+}
+
+function betweenMonths_(rowMonth, startMonth, endMonth){
+  const d = parseMonth_(rowMonth);
+  if(!d) return true;
+  if(startMonth){
+    const a = parseMonth_(startMonth);
+    if(a && d < a) return false;
+  }
+  if(endMonth){
+    const b = parseMonth_(endMonth);
+    if(b && d > b) return false;
+  }
+  return true;
+}
+
+function matchFilter_(val, filter){
+  if(!filter || (Array.isArray(filter) && filter.length===0)) return true;
+  const v = String(val||'').toLowerCase();
+  if(Array.isArray(filter)) return filter.some(x => v === String(x||'').toLowerCase());
+  return v.includes(String(filter).toLowerCase());
+}
+
+function isJune2025_(label){
+  const d = parseMonth_(label);
+  return !!(d && d.getUTCFullYear()===2025 && d.getUTCMonth()===5);
+}
+
+function defaultStartYM_(){ return UI_START_YM; }
+function defaultEndYM_(){ return toYM_(new Date()); }
+
+/** ===== Business logic: computed columns (PR) ===== */
+function computePRRow_(r){
+  const num = k => Number(r[k])||0;
+  const totalDep = num('Total Deposit');
+  const totalWdr = num('Total Withdraw');
+  const cwl = num('Company Win/Loss');
+  const bonus = num('Bonus');
+  const turnover = num('Turnover');
+  const unique = num('Unique Player');
+  const signup = num('SignUp Player');
+  const ftd = num('FTD Player');
+
+  r['Net Deposit'] = totalDep - totalWdr;
+  r['Net Win/Loss'] = cwl - bonus;
+  r['Net Ratio'] = totalDep ? (r['Net Deposit']/totalDep)*100 : 0;
+  r['Gross Revenue %'] = totalDep ? (r['Net Deposit']/totalDep)*100 : 0;
+  r['Bonus %'] = cwl ? (bonus/cwl)*100 : 0;
+  r['Ave DEP'] = unique ? (totalDep/unique) : 0;
+  r['Ave Bonus/Player'] = unique ? (bonus/unique) : 0;
+  r['Ave Turnover'] = unique ? (turnover/unique) : 0;
+  r['Ave WR'] = totalDep ? (turnover/totalDep) : 0;
+  r['NGR per Player'] = unique ? ((cwl - bonus)/unique) : 0;
+  r['Net per Player'] = unique ? (r['Net Deposit']/unique) : 0;
+  r['FTD Conversion Rate'] = signup ? (ftd/signup)*100 : 0;
+  return r;
+}
+
+function setRetentionRates_(rows, juneRows = []){
+  const groupBy = ['Brand Group','Brand','Currency'];
+  const keyOf = r => groupBy.map(h => String(r[h] ?? '')).join('|');
+  const monthStr = r => String(r['Month'] ?? '');
+  const groups = new Map();
+
+  for(const r of rows){
+    const k = keyOf(r);
+    const m = monthStr(r);
+    if(!groups.has(k)) groups.set(k, new Map());
+    const gm = groups.get(k);
+    const rec = gm.get(m) || { rows:[], u:0, f:0 };
+    rec.rows.push(r);
+    rec.u += Number(r['Unique Player'])||0;
+    rec.f += Number(r['FTD Player'])||0;
+    gm.set(m, rec);
+  }
+
+  const juneGroups = new Map();
+  for(const r of juneRows){
+    const k = keyOf(r);
+    if(!juneGroups.has(k)) juneGroups.set(k, {u:0, f:0});
+    const rec = juneGroups.get(k);
+    rec.u += Number(r['Unique Player'])||0;
+    rec.f += Number(r['FTD Player'])||0;
+  }
+
+  for(const [k, gm] of groups.entries()){
+    const months = [...gm.keys()].sort((a,b)=> (parseMonth_(a)-parseMonth_(b)));
+    let prevUnique = 0;
+    if (months.length > 0) {
+      const firstM = months[0];
+      const juneRec = juneGroups.get(k);
+      if (firstM === '2025-07' && juneRec) {
+        prevUnique = juneRec.u;
+      }
+    }
+    for(const m of months){
+      const rec = gm.get(m);
+      const returning = Math.max(0, rec.u - rec.f);
+      const rate = (prevUnique>0) ? (returning/prevUnique)*100 : 0;
+      rec.rows.forEach(row => row['Retention Rate %'] = rate);
+      prevUnique = rec.u;
+    }
+  }
+}
+
+/** ===== Endpoints ===== */
+function fetchPRMonthly(filters){
+  filters = filters || {};
+  const values = getRangeValues_(SHEET_PR, RANGE_PR);
+  if(!values.length) return { headers:[], rows:[] };
+
+  const headers = values[0].map(String);
+  const rowsRaw = values.slice(1);
+  const startYM = filters.startMonth || defaultStartYM_();
+  const endYM   = filters.endMonth   || defaultEndYM_();
+
+  const data = toObjects_(headers, rowsRaw)
+    .filter(r => !isJune2025_(String(r['Month']||'')))
+    .filter(r => betweenMonths_(String(r['Month']||''), startYM, endYM))
+    .filter(r => matchFilter_(r['Brand Group'], filters.brandGroups || filters.brandGroup))
+    .filter(r => matchFilter_(r['Brand'], filters.brands || filters.brand))
+    .filter(r => matchFilter_(r['Currency'], filters.currencies || filters.currency))
+    .map(computePRRow_)
+    .filter(r => (Number(r['Total Deposit'])||0) > 0);
+
+  let juneRows = toObjects_(headers, rowsRaw)
+    .filter(r => isJune2025_(String(r['Month']||'')))
+    .filter(r => matchFilter_(r['Brand Group'], filters.brandGroups || filters.brandGroup))
+    .filter(r => matchFilter_(r['Brand'], filters.brands || filters.brand))
+    .filter(r => matchFilter_(r['Currency'], filters.currencies || filters.currency))
+    .map(computePRRow_)
+    .filter(r => (Number(r['Total Deposit'])||0) > 0);
+
+  setRetentionRates_(data, juneRows);
+
+  const wantedHeaders = [
+    'Month','Brand Group','Brand','Currency',
+    'Total Deposit','Total Withdraw','Net Deposit','Bonus','Bonus %',
+    'Company Win/Loss','Gross Revenue %','Turnover',
+    'Ave DEP','Ave WR','Ave Turnover','Ave Bonus/Player',
+    'SignUp Player','FTD Player','FTD Conversion Rate','Unique Player',
+    'Retention Rate %','NGR per Player','Net per Player','Net Ratio','Net Win/Loss'
+  ];
+  data.forEach(r => wantedHeaders.forEach(h => { if(!(h in r)) r[h] = (typeof r[h] === 'number') ? 0 : r[h]; }));
+  return { headers:wantedHeaders, rows:data };
+}
+
+function fetchDepositWithdraw(filters){
+  filters = filters || {};
+  const values = getRangeValues_(SHEET_PR, RANGE_PR);
+  if(!values.length) return { headers:[], rows:[], monthHeaders:[] };
+
+  const headers = values[0].map(String);
+  const rowsRaw = values.slice(1);
+  const startYM = filters.startMonth || defaultStartYM_();
+  const endYM   = filters.endMonth   || defaultEndYM_();
+
+  const prRows = toObjects_(headers, rowsRaw)
+    .filter(r => (Number(r['Total Deposit'])||0) > 0)
+    .filter(r => !isJune2025_(String(r['Month']||'')))
+    .filter(r => betweenMonths_(String(r['Month']||''), startYM, endYM))
+    .filter(r => matchFilter_(r['Brand Group'], filters.brandGroups || filters.brandGroup))
+    .filter(r => matchFilter_(r['Brand'], filters.brands || filters.brand))
+    .filter(r => matchFilter_(r['Currency'], filters.currencies || filters.currency));
+
+  const monthHeaders = [...new Set(prRows.map(r => String(r['Month']||'').trim()).filter(Boolean))]
+    .sort((a,b)=> (parseMonth_(a)-parseMonth_(b)));
+
+  const keyOf = r => [r['Brand Group']||'', r['Brand']||'', r['Currency']||''].join('|');
+  const groups = new Map();
+
+  for(const r of prRows){
+    const k = keyOf(r);
+    if(!groups.has(k)) groups.set(k, { dep:new Map(), wdr:new Map(), meta:{ bg:r['Brand Group'], brand:r['Brand'], curr:r['Currency'] }});
+    const g = groups.get(k);
+    const m = String(r['Month']||'');
+    const dep = Number(r['Total Deposit'])||0;
+    const wdr = Number(r['Total Withdraw'])||0;
+    g.dep.set(m, (g.dep.get(m)||0) + dep);
+    g.wdr.set(m, (g.wdr.get(m)||0) + wdr);
+  }
+
+  const baseHeaders = ['Brand Group','Brand','Currency','Type'];
+  const finalHeaders = baseHeaders.concat(monthHeaders);
+  const out = [];
+
+  for(const { dep, wdr, meta } of groups.values()){
+    const rowDep = { 'Brand Group':meta.bg, 'Brand':meta.brand, 'Currency':meta.curr, 'Type':'Total Deposit' };
+    const rowWdr = { 'Brand Group':meta.bg, 'Brand':meta.brand, 'Currency':meta.curr, 'Type':'Total Withdraw' };
+    const rowNet = { 'Brand Group':meta.bg, 'Brand':meta.brand, 'Currency':meta.curr, 'Type':'Total Net Deposit' };
+    for(const m of monthHeaders){
+      const d = dep.get(m)||0;
+      const w = wdr.get(m)||0;
+      rowDep[m]=d; rowWdr[m]=w; rowNet[m]=d-w;
+    }
+    out.push(rowDep, rowWdr, rowNet);
+  }
+
+  return { headers:finalHeaders, rows:out, monthHeaders };
+}
+
+/** ===== HTTP + date helpers (used by FX) ===== */
+function httpGetJson_(url){
+  const res = UrlFetchApp.fetch(url, {
+    muteHttpExceptions:true,
+    followRedirects:true,
+    validateHttpsCertificates:true
+  });
+  if(res.getResponseCode() !== 200) throw new Error('HTTP ' + res.getResponseCode() + ' for ' + url);
+  return JSON.parse(res.getContentText() || '{}');
+}
+function utcDate_(y,mIndex,d){ return new Date(Date.UTC(y, mIndex, d, 12, 0, 0)); }
+
+/** ===== FX helpers (CCY per 1 USD) ===== */
+function normalizeAndOrientRates_(rates){
+  const up = {};
+  Object.keys(rates||{}).forEach(k=>{
+    const v = Number(rates[k]);
+    if(isFinite(v) && v>0) up[String(k).toUpperCase()] = v;
+  });
+  if(!up.USD) up.USD = 1;
+
+  // Heuristic to flip if a provider returns USD-per-CCY
+  const anchors = { VND:20000, IDR:10000, BDT:50, PKR:50, LKR:150, MMK:500, KRW:800 };
+  let seen=0, suspicious=0;
+  for(const [ccy] of Object.entries(anchors)){
+    if(up[ccy] != null){ seen++; if(up[ccy] < 1) suspicious++; }
+  }
+  const needInvert = seen && (suspicious/seen) > 0.6;
+  if(needInvert){
+    const inv = {};
+    Object.keys(up).forEach(k => inv[k] = up[k] ? 1/up[k] : up[k]);
+    inv.USD = 1;
+    return inv;
+  }
+  return up;
+}
+
+function ensureMonthObject_(base, ym, rates, source){
+  base = String(base||'USD').toUpperCase();
+  rates = rates || {};
+  if(rates[base]==null) rates[base]=1;
+  return { base, month:ym, rates, source:source || 'fallback' };
+}
+
+function fillCrossFrom_(base, avg, snapshot){
+  avg = avg || {};
+  if(!snapshot || !snapshot.rates) return avg;
+  const snapBase = String(snapshot.base || base).toUpperCase();
+  const sr = snapshot.rates || {};
+  if(snapBase === base){
+    Object.keys(sr).forEach(ccy => { if(avg[ccy]==null) avg[ccy]=sr[ccy]; });
+  } else if(sr[base] && sr[base]>0){
+    const snapBaseToBase = sr[base];
+    Object.keys(sr).forEach(ccy => {
+      const v = sr[ccy];
+      if(avg[ccy]==null && typeof v==='number' && v>0){
+        avg[ccy] = v / snapBaseToBase;
+      }
+    });
+  }
+  if(avg[base]==null) avg[base]=1;
+  return avg;
+}
+
+function toObjects_(headers, rows){
+  const hs = (headers||[]).map(String);
+  return (rows||[]).map(r=>{
+    const o={};
+    hs.forEach((h,i)=> o[h] = normalizeNumber_(r[i]));
+    return o;
+  });
+}
+
+function normalizeMonths_(months){
+  if(!months) return [];
+  const arr = Array.isArray(months) ? months : String(months).split(',');
+  const ys = arr.map(x=>String(x||'').trim()).filter(Boolean).map(normalizeYM_).filter(Boolean);
+  return [...new Set(ys)].sort();
+}
+
+/** ===== FX Providers (used for "live" or dated peeks only) ===== */
+function providerERAPILatest_(base){
+  base = String(base||'USD').toUpperCase();
+  const url = 'https://open.er-api.com/v6/latest/' + encodeURIComponent(base);
+  const json = httpGetJson_(url);
+  if(json && json.result==='success' && json.rates){
+    return { base: json.base_code||base, date:(json.time_last_update_utc||'').slice(0,10), rates: normalizeAndOrientRates_(json.rates) };
+  }
+  throw new Error('ER-API invalid payload');
+}
+function providerExHost_(base, dateOrNull){
+  base = String(base||'USD').toUpperCase();
+  const path = dateOrNull ? dateOrNull : 'latest';
+  const url = 'https://api.exchangerate.host/' + path + '?base=' + encodeURIComponent(base);
+  const json = httpGetJson_(url);
+  if(json && json.rates){
+    return { base: json.base||base, date: json.date || (dateOrNull||''), rates: normalizeAndOrientRates_(json.rates) };
+  }
+  throw new Error('exchangerate.host invalid payload');
+}
+function providerCurrencyApiDated_(base, ymd){
+  base = String(base||'USD').toLowerCase();
+  const url = 'https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@' + ymd + '/v1/currencies/' + base + '.json';
+  const json = httpGetJson_(url);
+  const inner = json && json[base];
+  if(inner) return { base: base.toUpperCase(), date: json.date || ymd, rates: normalizeAndOrientRates_(inner) };
+  throw new Error('currency-api dated payload missing base map');
+}
+function providerCurrencyApiLatest_(base){
+  base = String(base||'USD').toLowerCase();
+  const url = 'https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@latest/v1/currencies/' + base + '.json';
+  const json = httpGetJson_(url);
+  const inner = json && json[base];
+  if(inner) return { base: base.toUpperCase(), date: json.date || '', rates: normalizeAndOrientRates_(inner) };
+  throw new Error('currency-api latest payload missing base map');
+}
+
+/** ===== Your HTML-identical EOM snapshot path ===== */
+function fetchFrankfurter(ym, base="USD"){
+  const [y,m] = ym.split("-").map(Number);
+  const start = `${y}-${String(m).padStart(2,"0")}-01`;
+  const end   = new Date(Date.UTC(y, m, 0));
+  const endStr= Utilities.formatDate(end,'UTC','yyyy-MM-dd');
+  const url   = `https://api.frankfurter.dev/v1/${start}..${endStr}?base=${base}`;
+  try{
+    const data = httpGetJson_(url);
+    const dates = Object.keys(data.rates || {}).sort();
+    const last  = dates[dates.length-1];
+    const rates = (data.rates && data.rates[last]) ? data.rates[last] : {};
+    rates[base] = 1; // explicit
+    return { ym, date:last, rates, source:"ecb" };
+  }catch(e){
+    Logger.log(`Frankfurter error for ${ym}: ${e}`);
+    return { ym, date:null, rates:{}, source:"ecb" };
+  }
+}
+
+function fetchAlternative(targetCcy, ymDate){
+  const k = `alt:${targetCcy}:${ymDate}`;
+  const cache = PropertiesService.getScriptProperties();
+  const cached = cache.getProperty(k);
+  if(cached) return JSON.parse(cached);
+
+  // 1) fawaz (dated USD map)
+  let url = `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@${ymDate}/v1/currencies/usd.min.json`;
+  try{
+    const data = httpGetJson_(url);
+    const v = data && data.usd && data.usd[targetCcy.toLowerCase()];
+    if(v!=null){
+      const obj = { rate:+v, src:"fallback" };
+      cache.setProperty(k, JSON.stringify(obj));
+      return obj;
+    }
+  }catch(e){ Logger.log(`fawaz fallback fail for ${targetCcy}: ${e}`); }
+
+  // 2) pegged → try CurrencyFreaks (latest)
+  if(PEGGED_CCYS.indexOf(targetCcy) >= 0){
+    url = `https://api.currencyfreaks.com/v2.0/rates/latest?apikey=free&symbols=${targetCcy}`;
+    try{
+      const data = httpGetJson_(url);
+      const v = data && data.rates && data.rates[targetCcy];
+      if(v!=null){
+        const obj = { rate:+v, src:"fallback" };
+        cache.setProperty(k, JSON.stringify(obj));
+        return obj;
+      }
+    }catch(e){ Logger.log(`currencyfreaks fail for ${targetCcy}: ${e}`); }
+  }
+
+  // 3) ExchangeRate-API (latest)
+  url = "https://api.exchangerate-api.com/v4/latest/USD";
+  try{
+    const data = httpGetJson_(url);
+    const v = data && data.rates && data.rates[targetCcy];
+    if(v!=null){
+      const obj = { rate:+v, src:"fallback" };
+      cache.setProperty(k, JSON.stringify(obj));
+      return obj;
+    }
+  }catch(e){ Logger.log(`exchangerate-api fail for ${targetCcy}: ${e}`); }
+
+  return { rate:null, src:"fallback" };
+}
+
+function eomRates(ym, base="USD"){
+  const [y,m] = ym.split("-").map(Number);
+  const end   = new Date(Date.UTC(y, m, 0));
+  const ymDate= Utilities.formatDate(end,'UTC','yyyy-MM-dd');
+
+  const frank = fetchFrankfurter(ym, base);
+
+  const rates = Object.assign({}, frank.rates);
+  const sourceMap = {};
+  Object.keys(rates).forEach(k => sourceMap[k] = "ecb");
+
+  // Fill only the known-missing set (identical to your HTML)
+  for(const ccy of MISSING_CCYS){
+    if(rates[ccy]==null){
+      const alt = fetchAlternative(ccy, ymDate);
+      rates[ccy] = alt.rate;
+      sourceMap[ccy] = (alt.rate==null) ? "na" : "fallback";
+    }
+  }
+
+  if(rates[base]==null) rates[base]=1;
+
+  return { ym, date: frank.date || ymDate, rates, sourceMap };
+}
+
+/** Core dated fetcher (for "live" widget paths only) */
+function getRatesForDate(base, date){
+  base = String(base||'USD').toUpperCase();
+  if(date==null){
+    try{ return providerCurrencyApiLatest_(base); }catch(e1){}
+    try{ return providerExHost_(base, null); }catch(e2){}
+    return providerERAPILatest_(base);
+  }
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Bad date: '+date);
+  try{ return providerExHost_(base, date); }catch(e1){}
+  try{ return providerCurrencyApiDated_(base, date); }catch(e2){}
+  const tryDate = new Date(date+'T12:00:00Z');
+  for(let i=1;i<=3;i++){
+    const back = new Date(tryDate.getTime() - i*86400000);
+    const ymd = Utilities.formatDate(back,'UTC','yyyy-MM-dd');
+    try{ return providerCurrencyApiDated_(base, ymd); }catch(_){}
+  }
+  throw new Error('No historical rates for '+date);
+}
+
+/** ===== Monthly (public) =====
+ * Returns: { base, month, date, rates{CCY:number}, source: {CCY:'ecb'|'fallback'|'na'} }
+ * Orientation: CCY per 1 USD, no averages, snapshot = EOM last-business-day
+ */
+function getRatesMonthly(base, ym){
+  base = String(base||'USD').toUpperCase();
+  if(!/^\d{4}-\d{2}$/.test(ym)) throw new Error('Invalid ym: '+ym);
+  const eom = eomRates(ym, base);
+  const rates = normalizeAndOrientRates_(eom.rates);
+  if(!rates.USD) rates.USD = 1;
+  return { base, month:ym, date:eom.date, rates, source:eom.sourceMap };
+}
+
+/** LIVE (latest) — base USD */
+function getRates(base){
+  return getRatesForDate(base || 'USD', null);
+}
+
+/** Batch */
+function getMonthlyRates(months){
+  const base = 'USD';
+  const out = {};
+  const miss = [];
+  const skipped = [];
+  let list = normalizeMonths_(months);
+  const autoDerived = !list.length;
+  if(autoDerived) list = deriveYMsFromSheet_();
+  // Exclude June 2025 only
+  list = list.filter(ym => ym !== '2025-06');
+
+  list.forEach(ym=>{
+    try{
+      const r = getRatesMonthly(base, ym);
+      out[ym] = r;
+      if(!r || !r.rates || Object.keys(r.rates).length <= 1){
+        miss.push({ ym, error:'No upstream FX' });
+      }
+    }catch(e){
+      out[ym] = ensureMonthObject_(base, ym, { [base]:1 }, 'error-fallback');
+      out[ym].date = ym + '-28';
+      miss.push({ ym, error:String(e) });
+    }
+  });
+  out._meta = { base, requested:list, missing:miss, skipped, autoDerived };
+  return out;
+}
+
+/** Derive months from PR with dep>0, within default window, excluding 2025-06 */
+function deriveYMsFromSheet_(){
+  try{
+    const vals = getRangeValues_(SHEET_PR, RANGE_PR);
+    if(!vals || vals.length < 2) return [];
+    const headers = vals[0].map(String);
+    const iMonth = headers.indexOf('Month');
+    const iDep   = headers.indexOf('Total Deposit');
+    if(iMonth<0 || iDep<0) return [];
+    const startYM = defaultStartYM_();
+    const endYM   = defaultEndYM_();
+    const set = new Set();
+    for(let r=1;r<vals.length;r++){
+      const rawM = vals[r][iMonth];
+      const dep  = Number(normalizeNumber_(vals[r][iDep])) || 0;
+      const d = parseMonth_(rawM);
+      if(!d || isNaN(d)) continue;
+      if(isJune2025_(rawM)) continue;
+      if(!betweenMonths_(rawM, startYM, endYM)) continue;
+      if(dep <= 0) continue;
+      set.add(toYM_(d));
+    }
+    return Array.from(set).sort();
+  }catch(e){
+    return [];
+  }
+}
+
+/** ===== Verify FX Coverage (with hash) ===== */
+function hex_(bytes){ return bytes.map(b=>('0'+(b&0xff).toString(16)).slice(-2)).join(''); }
+function shortHash_(obj){
+  const s = JSON.stringify(obj || {});
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s);
+  return hex_(bytes).slice(0,12);
+}
+
+function verifyFXRun_(monthsCsv){
+  const requested = normalizeMonths_(monthsCsv ? monthsCsv.split(',') : []);
+  const auto = requested.length===0;
+  const months = auto ? deriveYMsFromSheet_() : requested;
+
+  const expectedByYM = buildExpectedCurrenciesByMonth_();
+  const fx = getMonthlyRates(months);
+
+  const perMonth = (fx._meta.requested || months).map(ym=>{
+    const entry = fx[ym] || { base:'USD', month:ym, date:ym+'-28', rates:{ USD:1 }, source:'missing' };
+    const expectedSet = expectedByYM[ym] || new Set();
+    const expected = Array.from(expectedSet).sort();
+    const have = Object.keys(entry.rates || {}).sort();
+    const missing = expected.filter(ccy => have.indexOf(ccy) === -1);
+    return {
+      ym,
+      base: entry.base || 'USD',
+      date: entry.date || null,                 // << include EOM snapshot date for UI parity
+      source: entry.source || 'unknown',
+      expectedCurrencies: expected,
+      availableCurrencies: have,
+      missingCurrencies: missing,
+      counts: { expected: expected.length, available: have.length, missing: missing.length },
+      meta: { keys: have.length, ratesHash: shortHash_(entry.rates) }
+    };
+  });
+
+  const warnings = perMonth.filter(x => x.counts.missing>0).map(x => ({ ym:x.ym, missing:x.missingCurrencies }));
+  return { ok:true, input:{ monthsCsv:monthsCsv||'', autoDerived:auto }, meta: fx._meta||{}, summary:{ monthsChecked:perMonth.length, monthsWithMissing:warnings.length }, warnings, perMonth };
+}
+
+/** Show selected CCY values per month for quick visual compare */
+function fxPeekRun_(monthsCsv, ccyCsv){
+  const months = normalizeMonths_(monthsCsv ? monthsCsv.split(',') : []);
+  const currencies = (ccyCsv || '').split(',').map(s => String(s||'').trim().toUpperCase()).filter(Boolean);
+  const map = getMonthlyRates(months);
+  const out = months.map(ym=>{
+    const ent = map[ym] || { rates:{ USD:1 }, source:'missing', meta:{} };
+    const row = {
+      ym,
+      date: ent.date || null,                   // << include date for 1:1 with your HTML header
+      source: ent.source || 'unknown',
+      hash: shortHash_(ent.rates),
+      keys: Object.keys(ent.rates || {}).length
+    };
+    currencies.forEach(k=>{
+      const v = ent.rates && ent.rates[k];
+      row[k] = (typeof v==='number' && isFinite(v)) ? Number(v.toFixed(6)) : null;
+    });
+    return row;
+  });
+  return { ok:true, months, currencies, rows: out };
+}
+
+function buildExpectedCurrenciesByMonth_(){
+  const map = {};
+  try{
+    const vals = getRangeValues_(SHEET_PR, RANGE_PR);
+    if(!vals || vals.length<2) return map;
+    const headers = vals[0].map(String);
+    const iMonth = headers.indexOf('Month');
+    const iDep   = headers.indexOf('Total Deposit');
+    const iCurr  = headers.indexOf('Currency');
+    if(iMonth<0 || iCurr<0 || iDep<0) return map;
+
+    const startYM = defaultStartYM_();
+    const endYM   = defaultEndYM_();
+
+    for(let r=1;r<vals.length;r++){
+      const rawM = vals[r][iMonth];
+      const dep  = Number(normalizeNumber_(vals[r][iDep])) || 0;
+      const curr = String(vals[r][iCurr] || '').trim().toUpperCase();
+      const d = parseMonth_(rawM);
+      if(!d || isNaN(d)) continue;
+      if(isJune2025_(rawM)) continue;
+      if(!betweenMonths_(rawM, startYM, endYM)) continue;
+      if(dep <= 0) continue;
+      const ym = toYM_(d);
+      if(!map[ym]) map[ym] = new Set();
+      if(curr) map[ym].add(curr);
+    }
+  }catch(e){
+    Logger.log('[verify] error: ' + (e && e.message || e));
+  }
+  return map;
+}
+
+/** ===== Debug helpers ===== */
+function debugFxBatch(){
+  const r = getMonthlyRates(deriveYMsFromSheet_());
+  Logger.log(JSON.stringify(r, null, 2));
+}
+function debugVerifyAll(){
+  const r = verifyFXRun_('');
+  Logger.log(JSON.stringify(r, null, 2));
+}
+
+/** JSON helper */
+function asJSON_(obj){
+  return ContentService.createTextOutput(JSON.stringify(obj, null, 2))
+    .setMimeType(ContentService.MimeType.JSON);
+}
